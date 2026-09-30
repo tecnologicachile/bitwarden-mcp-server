@@ -43,7 +43,7 @@ The [Model Context Protocol](https://modelcontextprotocol.io/) is an open standa
 
 ### Vault Management and CLI tools (CLI)
 
-- **Session Management**: Lock vault, sync with server, check status
+- **Session Management**: Unlock vault via native OS password dialog, lock vault, sync with server, check status
 - **Item Operations**: List, retrieve, create, edit, delete, restore vault items
   - Supports logins, secure notes, cards, and identities
   - Advanced filtering by URL, folder, collection, or trash status
@@ -170,14 +170,15 @@ Any MCP-compatible client can connect to this server via stdio transport. Refer 
 
 ### Environment Variables
 
-| Variable                 | Required For    | Description                                      | Default                            |
-| ------------------------ | --------------- | ------------------------------------------------ | ---------------------------------- |
-| `BW_SESSION`             | CLI operations  | Session token from `bw unlock --raw`             | -                                  |
-| `BW_CLIENT_ID`           | API operations  | Organization API client ID                       | -                                  |
-| `BW_CLIENT_SECRET`       | API operations  | Organization API client secret                   | -                                  |
-| `BW_API_BASE_URL`        | API operations  | Bitwarden API base URL                           | `https://api.bitwarden.com`        |
-| `BW_IDENTITY_URL`        | API operations  | OAuth2 identity server URL                       | `https://identity.bitwarden.com`   |
-| `BW_ALLOWED_DIRECTORIES` | File operations | Comma-separated list of allowed file directories | `os.tmpdir() + '/bitwarden-files'` |
+| Variable                 | Required For    | Description                                                                                                                                                                                                          | Default                          |
+| ------------------------ | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| `BW_SESSION`             | CLI operations  | Session token from `bw unlock --raw`                                                                                                                                                                                 | -                                |
+| `BW_CLIENT_ID`           | API operations  | Organization API client ID                                                                                                                                                                                           | -                                |
+| `BW_CLIENT_SECRET`       | API operations  | Organization API client secret                                                                                                                                                                                       | -                                |
+| `BW_API_BASE_URL`        | API operations  | Bitwarden API base URL                                                                                                                                                                                               | `https://api.bitwarden.com`      |
+| `BW_IDENTITY_URL`        | API operations  | OAuth2 identity server URL                                                                                                                                                                                           | `https://identity.bitwarden.com` |
+| `BW_ALLOWED_DIRECTORIES` | File operations | Comma-separated list of allowed file directories. **Required** for file-based tools (e.g. `create_file_send`, `create_attachment`, `get` with `object: "attachment"`); when unset, all file operations are rejected. | -                                |
+| `BW_CLI_PATH`            | CLI operations  | Absolute path to the `bw` executable or its JS entry point. Only needed when the CLI cannot be auto-located on `PATH` (e.g. it is not on `PATH`, or a non-standard global install layout).                           | auto-resolved from `PATH`        |
 
 **Note:** For self-hosted Bitwarden instances, set `BW_API_BASE_URL` and `BW_IDENTITY_URL` to your server URLs.
 
@@ -207,7 +208,7 @@ Once configured, you can interact with Bitwarden through your AI assistant:
 
 ### Vault Management and CLI Tools
 
-- **Session**: `lock`, `sync`, `status`
+- **Session**: `lock`, `unlock`, `sync`, `status`
 - **Retrieval**: `list`, `get`
 - **Items**: `create_item`, `edit_item`, `delete`, `restore`
 - **Folders**: `create_folder`, `edit_folder`
@@ -314,16 +315,30 @@ export NODE_ENV=development
 ### CLI Issues
 
 - **Vault is locked**
+  - Ask your AI assistant to run the `unlock` tool — the MCP server will open a native OS password dialog for you to enter your master password. The password is never sent through the MCP protocol or seen by the LLM.
+  - On headless machines (no `DISPLAY` on Linux, no GUI session), the `unlock` tool will refuse to run. Use the manual fallback:
 
-  ```bash
-  bw unlock --raw
-  # Copy the token and update BW_SESSION in your MCP config
-  ```
+    ```bash
+    bw unlock --raw
+    # Copy the token and update BW_SESSION in your MCP config
+    ```
 
 - **Session key is invalid**
   - Session tokens expire after inactivity
-  - Run `bw unlock --raw` to get a fresh token
-  - Update your MCP configuration with the new token
+  - Ask your AI assistant to run the `unlock` tool to refresh the session in-place, or run `bw unlock --raw` manually and update your MCP configuration with the new token
+
+### Unlocking the vault interactively
+
+The `unlock` tool lets your AI assistant prompt you for your master password without that password ever crossing the MCP channel.
+
+- The tool takes **no input parameters**. It cannot be invoked with a password argument.
+- When called, the server launches a **native OS password dialog**:
+  - **macOS**: `osascript` secure input dialog
+  - **Linux**: `zenity --password` (falls back to `kdialog --password`)
+  - **Windows**: PowerShell WinForms password dialog (masked input)
+- The password is passed to `bw unlock --raw` via the `--passwordenv` flag with a randomized one-shot environment variable. It never appears in process arguments, in the MCP protocol, or in the LLM's context.
+- The LLM only ever sees `"Vault unlocked successfully."` or a sanitized failure message (e.g. `"Invalid master password."`, `"Unlock cancelled."`).
+- If you are in a non-interactive environment, the tool will refuse to run and return a fixed message directing you to the `bw unlock --raw` manual flow.
 
 ### API Issues
 

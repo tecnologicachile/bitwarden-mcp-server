@@ -2,8 +2,29 @@
  * Security utilities for input sanitization and validation
  */
 
+import fs from 'fs';
 import path from 'path';
-import os from 'os';
+
+/**
+ * Canonicalize a filesystem path by resolving symbolic links.
+ *
+ * Uses fs.realpathSync.native() when the path exists. If the path does not
+ * exist (e.g. a not-yet-created download target), we recursively canonicalize
+ * the longest existing ancestor and re-attach the missing tail. This ensures
+ * a partially-existing path cannot smuggle in a symlinked ancestor that
+ * silently redirects outside the allowlist.
+ */
+function canonicalizePath(filePath: string): string {
+  try {
+    return fs.realpathSync.native(filePath);
+  } catch {
+    const parent = path.dirname(filePath);
+    if (parent === filePath) {
+      return filePath;
+    }
+    return path.join(canonicalizePath(parent), path.basename(filePath));
+  }
+}
 
 /**
  * Sanitizes a string to prevent command injection by removing dangerous characters
@@ -195,13 +216,14 @@ export function sanitizeApiParameters(params: unknown): unknown {
  * Security measures:
  * - URL decoding (iterative to handle double encoding)
  * - Unicode normalization (NFC form)
- * - Path resolution to canonical form
+ * - Path resolution to canonical form (with symlink resolution via realpath)
  * - Allowlist-based directory validation
  * - Protection against all known bypass techniques
  *
  * Configuration:
  * Set BW_ALLOWED_DIRECTORIES environment variable to a comma-separated list
- * of allowed directories. If not set, defaults to system temp directory.
+ * of allowed directories. If not set (or empty), file operations are
+ * rejected — explicit opt-in is required.
  *
  * Example: BW_ALLOWED_DIRECTORIES=/tmp/bitwarden,/home/user/downloads
  */
@@ -251,6 +273,13 @@ export function validateFilePath(filePath: string): boolean {
     // This converts fullwidth characters and other Unicode variants to standard form
     const normalizedPath = decodedPath.normalize('NFC');
 
+    // The raw string (not the decoded form) is what reaches the filesystem, and
+    // the filesystem does not URL-decode or normalize. If the forms differ, the
+    // checks below would validate a different path than the one used, so reject.
+    if (normalizedPath !== filePath) {
+      return false;
+    }
+
     // Step 6: Check for dangerous patterns after decoding/normalization
     // This catches encoded traversal sequences like %2e%2e%2f
     const dangerousPatterns = [
@@ -283,24 +312,35 @@ export function validateFilePath(filePath: string): boolean {
       return false;
     }
 
-    // Step 8: Resolve to absolute canonical path
-    const resolvedPath = path.resolve(normalizedPath);
+    // Step 8: Resolve to absolute canonical path, including symlink resolution.
+    // Lexical resolution alone (path.resolve) only collapses ./ and ../; it does
+    // not follow symlinks. Without realpath, a symlink inside an allowed
+    // directory could target a file outside the allowlist and pass the prefix
+    // check below. canonicalizePath() resolves symlinks via realpath and falls
+    // back to lexical resolution for non-existent path segments.
+    const resolvedPath = canonicalizePath(path.resolve(normalizedPath));
 
     // Step 9: Get allowed directories from environment variable
+    // Fail closed: if BW_ALLOWED_DIRECTORIES is unset, reject all file operations.
+    // Defaulting to a world-writable location (e.g. /tmp on Linux/macOS) would
+    // allow other local users or services to stage files for the AI agent to
+    // read or send, so explicit opt-in is required.
     const allowedDirsEnv = process.env['BW_ALLOWED_DIRECTORIES'];
+    if (!allowedDirsEnv || !allowedDirsEnv.trim()) {
+      return false;
+    }
 
-    let allowedDirectories: string[];
-    if (allowedDirsEnv && allowedDirsEnv.trim()) {
-      // Parse comma-separated list and resolve each to absolute path
-      allowedDirectories = allowedDirsEnv
-        .split(',')
-        .map((dir) => dir.trim())
-        .filter((dir) => dir.length > 0)
-        .map((dir) => path.resolve(dir));
-    } else {
-      // Default to system temp directory if no whitelist configured
-      const defaultDir = path.join(os.tmpdir(), 'bitwarden-files');
-      allowedDirectories = [defaultDir];
+    // Allowed directories are canonicalized too, so that a symlinked allow-list
+    // entry (e.g. /tmp on macOS → /private/tmp) compares consistently with
+    // candidates that have been canonicalized through the symlink.
+    const allowedDirectories = allowedDirsEnv
+      .split(',')
+      .map((dir) => dir.trim())
+      .filter((dir) => dir.length > 0)
+      .map((dir) => canonicalizePath(path.resolve(dir)));
+
+    if (allowedDirectories.length === 0) {
+      return false;
     }
 
     // Step 10: Verify resolved path starts with one of the allowed directories

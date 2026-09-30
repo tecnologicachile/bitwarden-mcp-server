@@ -1,4 +1,7 @@
 import { describe, it, expect } from '@jest/globals';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import {
   sanitizeInput,
   validateParameter,
@@ -194,6 +197,7 @@ describe('Security - Command Injection Protection', () => {
       // Commands actually used in src/handlers/cli.ts
       const implementedCommands = [
         'lock',
+        'unlock',
         'sync',
         'status',
         'list',
@@ -686,6 +690,34 @@ describe('Security - Command Injection Protection', () => {
         });
       });
 
+      // The raw string is what reaches the filesystem, so a path whose decoded
+      // form sits inside the allowlist must still be rejected if the raw form
+      // differs from it.
+      it('should reject paths whose decoded form differs from the raw form', () => {
+        process.env['BW_ALLOWED_DIRECTORIES'] = '/tmp/bitwarden';
+
+        const mismatchedPaths = [
+          '/tmp/bitwarden%2Ffile.txt', // decodes to /tmp/bitwarden/file.txt
+          '/tmp/bitwarden%2Fsub/', // decodes to /tmp/bitwarden/sub/
+          '/tmp/bitwarden%252Ffile.txt', // double-encoded separator
+          '/tmp%2Fbitwarden%2Ffile.txt', // encoded separators in ancestors
+          '/tmp/bitwarden/a%20b.txt', // any decodable sequence
+          '/tmp/bitwarden/café.txt', // NFD; NFC form differs
+        ];
+
+        mismatchedPaths.forEach((path) => {
+          expect(validateFilePath(path)).toBe(false);
+        });
+      });
+
+      it('should still accept plain paths within whitelisted directories', () => {
+        process.env['BW_ALLOWED_DIRECTORIES'] = '/tmp/bitwarden';
+
+        expect(validateFilePath('/tmp/bitwarden/file.txt')).toBe(true);
+        expect(validateFilePath('/tmp/bitwarden/sub/')).toBe(true);
+        expect(validateFilePath('/tmp/bitwarden/café.txt')).toBe(true);
+      });
+
       it('should handle relative paths that resolve within whitelist', () => {
         process.env['BW_ALLOWED_DIRECTORIES'] = '/tmp/bitwarden';
 
@@ -697,6 +729,31 @@ describe('Security - Command Injection Protection', () => {
         // Result depends on whether CWD is in whitelist
         // We just verify the function doesn't crash
         expect(typeof result).toBe('boolean');
+      });
+
+      it('should reject all paths when BW_ALLOWED_DIRECTORIES is unset', () => {
+        delete process.env['BW_ALLOWED_DIRECTORIES'];
+
+        const candidatePaths = [
+          '/tmp/bitwarden-files/file.txt',
+          '/tmp/file.txt',
+          'document.pdf',
+          'C:/Users/me/file.txt',
+        ];
+
+        candidatePaths.forEach((path) => {
+          expect(validateFilePath(path)).toBe(false);
+        });
+      });
+
+      it('should reject all paths when BW_ALLOWED_DIRECTORIES is empty or whitespace', () => {
+        const emptyValues = ['', '   ', ',', ' , , '];
+
+        emptyValues.forEach((value) => {
+          process.env['BW_ALLOWED_DIRECTORIES'] = value;
+          expect(validateFilePath('/tmp/bitwarden-files/file.txt')).toBe(false);
+          expect(validateFilePath('document.pdf')).toBe(false);
+        });
       });
     });
 
@@ -747,6 +804,78 @@ describe('Security - Command Injection Protection', () => {
           const result = validateFilePath(path);
           expect(typeof result).toBe('boolean');
         });
+      });
+    });
+
+    describe('Symlink Resolution (VULN-585)', () => {
+      // Regression coverage for the lexical-prefix bypass: a symlink inside
+      // an allowed directory whose target lives outside the allowlist must
+      // be rejected once the candidate path is canonicalized.
+      const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bw-symlink-'));
+      const allowedDir = fs.realpathSync.native(
+        fs.mkdtempSync(path.join(tmpRoot, 'allowed-')),
+      );
+      const outsideDir = fs.realpathSync.native(
+        fs.mkdtempSync(path.join(tmpRoot, 'outside-')),
+      );
+      const outsideFile = path.join(outsideDir, 'secret.txt');
+      const insideFile = path.join(allowedDir, 'inside.txt');
+      const symlinkToOutsideFile = path.join(allowedDir, 'link-to-secret.txt');
+      const symlinkToOutsideDir = path.join(allowedDir, 'link-to-outside');
+
+      const originalEnv = process.env['BW_ALLOWED_DIRECTORIES'];
+
+      beforeAll(() => {
+        fs.writeFileSync(outsideFile, 'outside-allowlist-secret\n');
+        fs.writeFileSync(insideFile, 'inside-allowlist\n');
+        fs.symlinkSync(outsideFile, symlinkToOutsideFile);
+        fs.symlinkSync(outsideDir, symlinkToOutsideDir);
+      });
+
+      afterAll(() => {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        if (originalEnv) {
+          process.env['BW_ALLOWED_DIRECTORIES'] = originalEnv;
+        } else {
+          delete process.env['BW_ALLOWED_DIRECTORIES'];
+        }
+      });
+
+      beforeEach(() => {
+        process.env['BW_ALLOWED_DIRECTORIES'] = allowedDir;
+      });
+
+      it('should reject a symlink inside the allowlist that targets a file outside', () => {
+        expect(validateFilePath(symlinkToOutsideFile)).toBe(false);
+      });
+
+      it('should reject a path that traverses through a symlinked directory to a file outside', () => {
+        const traversed = path.join(symlinkToOutsideDir, 'secret.txt');
+        expect(validateFilePath(traversed)).toBe(false);
+      });
+
+      it('should still accept a real file inside the allowlist', () => {
+        expect(validateFilePath(insideFile)).toBe(true);
+      });
+
+      it('should accept a not-yet-created file inside the allowlist', () => {
+        const newFile = path.join(allowedDir, 'does-not-exist-yet.txt');
+        expect(validateFilePath(newFile)).toBe(true);
+      });
+
+      it('should accept paths under an allowlist entry that is itself a symlink', () => {
+        // Configure the allowlist via a symlink pointing at the real allowed
+        // directory. After canonicalization both sides must resolve to the
+        // same real path so legitimate files are still accepted.
+        const symlinkedAllowEntry = path.join(tmpRoot, 'allow-link');
+        fs.symlinkSync(allowedDir, symlinkedAllowEntry);
+        try {
+          process.env['BW_ALLOWED_DIRECTORIES'] = symlinkedAllowEntry;
+          expect(validateFilePath(insideFile)).toBe(true);
+          expect(validateFilePath(symlinkToOutsideFile)).toBe(false);
+        } finally {
+          fs.unlinkSync(symlinkedAllowEntry);
+        }
       });
     });
   });

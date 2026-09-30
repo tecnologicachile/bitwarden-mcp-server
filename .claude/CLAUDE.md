@@ -11,7 +11,7 @@ The MCP server exposes two distinct operational interfaces:
 **1. CLI Interface (Vault Management and CLI Tools)**
 
 - Wraps Bitwarden CLI (`bw`) commands for personal vault operations
-- Requires `BW_SESSION` environment variable
+- Requires `BW_SESSION` environment variable, or an interactive user who can supply it via the `unlock` tool (see "Unlock tool" below)
 - Executes shell commands with security hardening
 - Returns plain text or JSON responses from CLI
 
@@ -48,6 +48,40 @@ index.ts (tool routing)
 2. **Type Safety**: End-to-end TypeScript with Zod runtime validation
 3. **Security First**: All inputs validated and sanitized before execution
 4. **Consistent Patterns**: Same structure for CLI and API tools
+
+## Unlock tool
+
+The `unlock` tool reuses the CLI interface but has a custom security model
+because it must collect a master password without exposing it to the LLM.
+
+- **Empty schema** — the tool takes no parameters. This is enforced at the
+  Zod level (`unlockSchema = z.object({})`) so the password cannot be
+  smuggled in as an argument.
+- **Out-of-band password collection** — `src/utils/unlock.ts` spawns a
+  native OS password dialog (`osascript` on macOS, `zenity`/`kdialog` on
+  Linux, a PowerShell WinForms dialog on Windows). Dialog prompt text
+  MUST remain a compile-time constant — no interpolation of dynamic
+  values.
+- **Password never touches argv** — the password is handed to
+  `bw unlock --raw --passwordenv <RANDOM_NAME>`. The env var is scoped to
+  a **filtered child environment** (PATH/HOME/APPDATA + the password var
+  only) and never written to `process.env`.
+- **Stderr is scrubbed** — `scrubUnlockStderr` maps known `bw` error
+  strings to a fixed whitelist. Raw stderr is never returned to the LLM.
+- **Hard fail in non-interactive environments** — if no GUI is available,
+  the tool returns a fixed error directing the user to `bw unlock --raw`
+  manually. It NEVER falls back to prompting through MCP.
+- **Serialization + rate limit** — a module-level mutex prevents
+  concurrent unlock attempts; a minimum inter-attempt interval prevents
+  dialog-spam from a misbehaving LLM.
+- **Already-unlocked short-circuit** — the flow pre-checks `bw status` and
+  returns without showing a dialog if the vault is already unlocked.
+- **`handleLock` clears `BW_SESSION`** — on successful lock, the server
+  removes `BW_SESSION` from `process.env` so subsequent CLI calls fail
+  until the next unlock.
+
+Any future change to the unlock flow must preserve all of these
+invariants.
 
 ## Security Architecture
 
@@ -133,9 +167,10 @@ The `validateFilePath()` function provides defense-in-depth protection against p
 3. **UNC path blocking** - Prevents network share access (\\server\share)
 4. **Iterative URL decoding** - Handles multiple encoding layers (max 5 iterations)
 5. **Unicode normalization** - Converts fullwidth characters and variants to canonical form (NFC)
+   - **Raw/decoded mismatch rejection** - If decoding or normalization changed the path at all, it is rejected. `bw` receives the raw string and the filesystem does not decode it, so the validated form must be identical to the form used.
 6. **Pattern matching** - Detects traversal sequences (../, ..\, etc.)
 7. **Unicode lookalike detection** - Blocks alternative slash characters (U+2215, U+FF0F, etc.)
-8. **Path canonicalization** - Resolves to absolute paths
+8. **Path canonicalization** - Resolves to absolute paths and follows symlinks via `fs.realpathSync.native()`. Both the candidate path and every `BW_ALLOWED_DIRECTORIES` entry are canonicalized before the prefix check, so a symlink inside the allowlist cannot smuggle in a file whose real path is outside it. Non-existent path segments fall back to lexical resolution against the longest existing ancestor.
 9. **Allowlist validation** - Only permits files within `BW_ALLOWED_DIRECTORIES`
 
 **Environment Configuration**:
@@ -148,7 +183,7 @@ export BW_ALLOWED_DIRECTORIES="/home/user/downloads,/tmp/bitwarden-files"
 set BW_ALLOWED_DIRECTORIES=C:/Users/YourName/Documents,C:/Temp/Bitwarden
 ```
 
-**Default Behavior**: If not configured, defaults to system temp directory (`os.tmpdir()/bitwarden-files`)
+**Default Behavior**: If `BW_ALLOWED_DIRECTORIES` is unset or empty, `validateFilePath()` rejects every path (fail-closed). File-based tools require explicit opt-in via the env var.
 
 **Protects Against**:
 
@@ -161,6 +196,8 @@ set BW_ALLOWED_DIRECTORIES=C:/Users/YourName/Documents,C:/Temp/Bitwarden
 - UNC path variants (`\localhost\c$`)
 - Overlong UTF-8 encoding
 - Mixed encoding techniques
+- Symlink-based escapes (a symlink inside the allowlist whose target is outside it)
+- Encoded or non-NFC paths whose decoded form differs from the raw path passed to `bw`
 
 ### Security Rules
 
@@ -169,6 +206,7 @@ set BW_ALLOWED_DIRECTORIES=C:/Users/YourName/Documents,C:/Temp/Bitwarden
 3. **Whitelist allowed commands** - never trust user input
 4. **Pass arguments as array elements** to spawn() which handles them as literal strings
 5. **Validate file paths** using `validateFilePath()` - all file operations MUST go through this function
+   - If a `bw` command writes to disk even when no path is given (e.g. `get attachment` falls back to the server's working directory), the path parameter MUST be required for that operation. An optional path whose absence skips validation bypasses the allowlist.
 6. **Configure `BW_ALLOWED_DIRECTORIES`** - Always set explicit directory allowlist in production
 7. **Use environment variables** for credentials, never hardcode
 8. **Disable shell** - Always use `shell: false` option with spawn()
@@ -689,11 +727,18 @@ npm run build
 
 ### Publishing
 
-```bash
-npm version patch|minor|major
-npm run build
-npm publish
-```
+`release.yml` and `publish.yml` in this repo are **pure trigger workflows** — they emit a deployment event via `bitwarden/gh-actions/trigger-actions@main` and do no release/publish work themselves. The deployment event names a task (`release-mcp-server`, `publish-mcp-server`) which is handled downstream by the central release automation. The build artifact produced by this repo's `build.yml` is what the downstream consumes.
+
+Flow:
+
+1. Human dispatches `release.yml` from `main`.
+2. `trigger-actions` composite captures the source run context and creates a `task: release-mcp-server` deployment event. Reviewer policy / branch gating live with the downstream handler, not in this repo.
+3. The downstream handler validates the source run, reads the version from `package.json` on `main` via a cross-repo GitHub App token, downloads the artifact this repo's `build.yml` produced, creates a draft GitHub release on this repo (tag `v<version>`, asset `mcp-server-<version>.zip`), and retags `ghcr.io/bitwarden/mcp-server:dev` → `:<version>`.
+4. A human reviews the draft release and clicks Publish — drafts are intentionally never auto-published.
+5. Human dispatches `publish.yml` here with `version` (default `latest`).
+6. Same trigger chain (task `publish-mcp-server`) routes to the downstream publish handler: npm (OIDC trusted publisher), GitHub Package Registry, and retag `ghcr.io/bitwarden/mcp-server:<version>` → `:latest`. Each target is independently gated by a boolean input for partial re-runs.
+
+Local `npm publish` is not used. Do not add release/publish business logic to the workflows in this repo — they remain pure triggers. To change what release/publish does, change the downstream handler.
 
 ### Versioning
 

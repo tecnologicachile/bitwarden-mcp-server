@@ -1,7 +1,7 @@
 {
   "type": "module",
   "name": "@bitwarden/mcp-server",
-  "version": "2026.2.0",
+  "version": "2026.7.0",
   "description": "Bitwarden MCP Server",
   "repository": {
     "type": "git",
@@ -16,24 +16,24 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
     "shx": "0.4.0",
-    "zod": "4.3.6"
+    "zod": "4.4.3"
   },
   "devDependencies": {
-    "@eslint/js": "9.39.4",
-    "@jest/globals": "30.3.0",
-    "@modelcontextprotocol/inspector": "0.21.2",
+    "@eslint/js": "10.0.1",
+    "@jest/globals": "30.4.1",
+    "@modelcontextprotocol/inspector": "0.22.0",
     "@types/jest": "30.0.0",
-    "@types/node": "24.12.2",
-    "eslint": "9.39.4",
-    "globals": "17.5.0",
+    "@types/node": "24.13.2",
+    "eslint": "10.6.0",
+    "globals": "17.7.0",
     "husky": "9.1.7",
-    "jest": "30.3.0",
-    "jest-junit": "16.0.0",
-    "lint-staged": "16.4.0",
-    "prettier": "3.8.2",
-    "ts-jest": "29.4.9",
+    "jest": "30.4.2",
+    "jest-junit": "17.0.0",
+    "lint-staged": "17.0.8",
+    "prettier": "3.9.4",
+    "ts-jest": "29.4.11",
     "typescript": "5.9.3",
-    "typescript-eslint": "8.58.2"
+    "typescript-eslint": "8.62.1"
   },
   "bin": {
     "mcp-server-bitwarden": "dist/index.js"

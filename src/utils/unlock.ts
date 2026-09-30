@@ -9,6 +9,8 @@
 
 import { spawn } from 'child_process';
 import crypto from 'crypto';
+import { resolveBwInvocation } from './bw-cli.js';
+import { buildBwChildEnv } from './bw-env.js';
 
 /**
  * Module-local indirection for `child_process.spawn` so tests can
@@ -68,35 +70,6 @@ for (const [name, value] of [
 const HEADLESS_ERROR =
   'Interactive unlock is not supported in this environment. ' +
   'Run "bw unlock --raw" manually and set BW_SESSION.';
-
-/**
- * Env vars inherited by every `bw` child process we spawn. `bw` needs
- * HOME/APPDATA/etc. to locate its data directory; without them it would
- * read/write the wrong files or fail. The password env var is added
- * per-invocation on top of this allowlist — no other `process.env`
- * entries are passed to the child.
- */
-function buildBwChildEnv(extra?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  const passthrough = [
-    'PATH',
-    'HOME',
-    'USERPROFILE',
-    'APPDATA',
-    'LOCALAPPDATA',
-    'BITWARDENCLI_APPDATA_DIR',
-  ] as const;
-  for (const key of passthrough) {
-    const v = process.env[key];
-    if (v !== undefined) env[key] = v;
-  }
-  if (extra) {
-    for (const [k, v] of Object.entries(extra)) {
-      if (v !== undefined) env[k] = v;
-    }
-  }
-  return env;
-}
 
 export function isLinuxHeadless(): boolean {
   return !process.env['DISPLAY'] && !process.env['WAYLAND_DISPLAY'];
@@ -173,7 +146,11 @@ function checkAlreadyUnlocked(): Promise<boolean> {
         : undefined,
     );
 
-    const child = __testable.spawn('bw', ['status'], { shell: false, env });
+    const { command: bwExecutable, prefixArgs } = resolveBwInvocation();
+    const child = __testable.spawn(bwExecutable, [...prefixArgs, 'status'], {
+      shell: false,
+      env,
+    });
 
     let stdout = '';
     let settled = false;
@@ -259,22 +236,64 @@ async function collectPasswordLinux(): Promise<PasswordResult> {
 }
 
 function collectPasswordWindows(): Promise<PasswordResult> {
-  // Literal PowerShell script. Encoded as UTF-16LE + Base64 and passed
-  // via -EncodedCommand so no quoting / escaping is possible across
-  // the shell boundary.
+  // Literal PowerShell script rendering a WinForms dialog. Encoded as
+  // UTF-16LE + Base64 and passed via -EncodedCommand so no quoting /
+  // escaping is possible across the shell boundary.
+  //
+  // We do NOT use `$host.UI.PromptForCredential`: under the console host
+  // it prompts inline on the console rather than as a GUI window, and a
+  // process the MCP host spawns has no attached console, so it returns
+  // $null and the flow reports a false "Unlock cancelled" — the dialog
+  // never appears. A WinForms form renders regardless of console state.
   const script = [
     `$ErrorActionPreference = 'Stop'`,
-    `$cred = $host.UI.PromptForCredential('${DIALOG_TITLE}', '${DIALOG_PROMPT}', 'bitwarden', '')`,
-    `if (-not $cred) { exit 1 }`,
-    `$bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($cred.Password)`,
-    `try { [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr) }`,
-    `finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }`,
+    `Add-Type -AssemblyName System.Windows.Forms`,
+    `Add-Type -AssemblyName System.Drawing`,
+    `$form = New-Object System.Windows.Forms.Form`,
+    `$form.Text = '${DIALOG_TITLE}'`,
+    `$form.TopMost = $true`,
+    `$form.StartPosition = 'CenterScreen'`,
+    `$form.FormBorderStyle = 'FixedDialog'`,
+    `$form.MinimizeBox = $false`,
+    `$form.MaximizeBox = $false`,
+    `$form.ClientSize = New-Object System.Drawing.Size(360, 130)`,
+    `$label = New-Object System.Windows.Forms.Label`,
+    `$label.Text = '${DIALOG_PROMPT}'`,
+    `$label.AutoSize = $true`,
+    `$label.Location = New-Object System.Drawing.Point(12, 15)`,
+    `$textBox = New-Object System.Windows.Forms.TextBox`,
+    `$textBox.UseSystemPasswordChar = $true`,
+    `$textBox.Location = New-Object System.Drawing.Point(12, 45)`,
+    `$textBox.Size = New-Object System.Drawing.Size(336, 20)`,
+    `$ok = New-Object System.Windows.Forms.Button`,
+    `$ok.Text = 'Unlock'`,
+    `$ok.DialogResult = [System.Windows.Forms.DialogResult]::OK`,
+    `$ok.Location = New-Object System.Drawing.Point(192, 90)`,
+    `$cancel = New-Object System.Windows.Forms.Button`,
+    `$cancel.Text = 'Cancel'`,
+    `$cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel`,
+    `$cancel.Location = New-Object System.Drawing.Point(273, 90)`,
+    `$form.Controls.Add($label)`,
+    `$form.Controls.Add($textBox)`,
+    `$form.Controls.Add($ok)`,
+    `$form.Controls.Add($cancel)`,
+    `$form.AcceptButton = $ok`,
+    `$form.CancelButton = $cancel`,
+    `$form.Add_Shown({ $form.Activate(); $textBox.Focus() })`,
+    `if ($form.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { exit 1 }`,
+    `if ([string]::IsNullOrEmpty($textBox.Text)) { exit 1 }`,
+    // Emit UTF-8 without a BOM so a non-ASCII master password round-trips
+    // through the parent's default utf8 stdout decoding intact.
+    `[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false`,
+    `[Console]::Out.Write($textBox.Text)`,
   ].join('; ');
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  // -Sta forces a single-threaded apartment, required for WinForms.
   return spawnDialog('powershell.exe', [
     '-NoProfile',
     '-ExecutionPolicy',
     'Bypass',
+    '-Sta',
     '-EncodedCommand',
     encoded,
   ]);
@@ -387,9 +406,10 @@ function executeBwUnlock(password: string): Promise<UnlockResult> {
     let settled = false;
     let stdout = '';
     let stderr = '';
+    const { command: bwExecutable, prefixArgs } = resolveBwInvocation();
     const child = __testable.spawn(
-      'bw',
-      ['unlock', '--raw', '--passwordenv', envVarName],
+      bwExecutable,
+      [...prefixArgs, 'unlock', '--raw', '--passwordenv', envVarName],
       { shell: false, env: childEnv },
     );
 

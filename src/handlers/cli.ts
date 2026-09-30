@@ -3,7 +3,7 @@
  */
 
 import { executeCliCommand } from '../utils/cli.js';
-import { runUnlockFlow } from '../utils/unlock.js';
+import { isLinuxHeadless, runUnlockFlow } from '../utils/unlock.js';
 import { withValidation } from '../utils/validation.js';
 import {
   lockSchema,
@@ -61,6 +61,12 @@ function toMcpFormat(response: CliResponse) {
 }
 
 export const handleLock = withValidation(lockSchema, async () => {
+  // Clear the in-memory session before running `bw lock`. The intent of
+  // calling `lock` is "I want the session gone" — clearing up-front
+  // means we never leave a stale BW_SESSION in process.env if `bw lock`
+  // writes benign stderr on success (which would have looked like a
+  // failure to the previous conditional-clear).
+  delete process.env['BW_SESSION'];
   const response = await executeCliCommand('lock', []);
   return toMcpFormat(response);
 });
@@ -69,6 +75,20 @@ export const handleUnlock = withValidation(
   unlockSchema,
   async (validatedArgs) => {
     if (validatedArgs.password === undefined) {
+      // Sin escritorio (Linux por consola) el diálogo no puede abrirse:
+      // pedir la clave directo, sin pasar por runUnlockFlow, que contaría
+      // el intento como fallido y tras varios bloquearía el desbloqueo.
+      if (isLinuxHeadless()) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `No graphical interface available. Call this tool again with the master password as the 'password' parameter.`,
+            },
+          ],
+          isError: true,
+        };
+      }
       // GUI path: no password provided — use native OS dialog (upstream approach).
       // This never exposes the password to the LLM or MCP protocol.
       const result = await runUnlockFlow();
