@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from '@jest/globals';
+import { jest, describe, it, expect, afterEach } from '@jest/globals';
 import { z } from 'zod';
 import { validateInput } from '../src/utils/validation.js';
 import { validateFilePath } from '../src/utils/security.js';
@@ -2491,6 +2491,16 @@ describe('CLI Commands', () => {
  * These tests verify handler validation logic and response formatting
  * by calling handlers directly
  */
+
+// Mock CLI execution so handler tests never spawn the real `bw` binary.
+// Running it for real made each test take seconds (timeouts) and launched
+// dozens of concurrent Node processes that saturated CPU and memory.
+jest.mock('../src/utils/cli.js', () => ({
+  ...jest.requireActual<typeof import('../src/utils/cli.js')>(
+    '../src/utils/cli.js',
+  ),
+  executeCliCommand: jest.fn(async () => ({ output: 'mocked' })),
+}));
 
 // Import handlers directly - we're testing validation logic, not CLI execution
 import {
