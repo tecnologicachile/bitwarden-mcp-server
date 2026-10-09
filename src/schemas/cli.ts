@@ -12,6 +12,11 @@
 import { z } from 'zod';
 import { validateFilePath } from '../utils/security.js';
 
+// validateFilePath() also rejects every path when BW_ALLOWED_DIRECTORIES is
+// unset, so the message must point at the allowlist and not only at traversal.
+const FILE_PATH_REJECTED =
+  'must be inside a directory listed in BW_ALLOWED_DIRECTORIES (every path is rejected while it is unset), and path traversal patterns are not allowed';
+
 // Schema for validating 'lock' command parameters (no parameters required)
 export const lockSchema = z.object({});
 
@@ -100,7 +105,7 @@ export const getSchema = z
       .string()
       .optional()
       .refine((path) => !path || validateFilePath(path), {
-        message: 'Invalid output path: path traversal patterns are not allowed',
+        message: `Invalid output path: ${FILE_PATH_REJECTED}`,
       }),
   })
   .refine(
@@ -604,7 +609,7 @@ export const createFileSendSchema = z
       .string()
       .min(1, 'File path is required')
       .refine((path) => validateFilePath(path), {
-        message: 'Invalid file path: path traversal patterns are not allowed',
+        message: `Invalid file path: ${FILE_PATH_REJECTED}`,
       }),
     // Private notes (not shared with recipient)
     notes: z.string().optional(),
@@ -674,7 +679,7 @@ export const createAttachmentSchema = z.object({
     .string()
     .min(1, 'File path is required')
     .refine((path) => validateFilePath(path), {
-      message: 'Invalid file path: path traversal patterns are not allowed',
+      message: `Invalid file path: ${FILE_PATH_REJECTED}`,
     }),
   // ID of the item to attach the file to
   itemId: z.string().min(1, 'Item ID is required'),
