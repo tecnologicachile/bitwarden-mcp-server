@@ -3,7 +3,11 @@
  */
 
 import { executeCliCommand } from '../utils/cli.js';
-import { isLinuxHeadless, runUnlockFlow } from '../utils/unlock.js';
+import {
+  isLinuxHeadless,
+  runUnlockFlow,
+  scrubUnlockStderr,
+} from '../utils/unlock.js';
 import { withValidation } from '../utils/validation.js';
 import {
   lockSchema,
@@ -59,6 +63,11 @@ function toMcpFormat(response: CliResponse) {
     ],
   };
 }
+
+// Password-path unlock: one retry for failures that are not a rejected
+// password (see handleUnlock).
+const UNLOCK_PASSWORD_ATTEMPTS = 2;
+const UNLOCK_RETRY_DELAY_MS = 2000;
 
 export const handleLock = withValidation(lockSchema, async () => {
   // Clear the in-memory session before running `bw lock`. The intent of
@@ -120,30 +129,54 @@ export const handleUnlock = withValidation(
     // Headless path: password provided — pass via env var, never as a shell
     // argument. bw often writes Node.js deprecation warnings to stderr even
     // on success, so use stdout (the raw session key) as the success signal.
-    const response = await executeCliCommand(
-      'unlock',
-      ['--passwordenv', 'BW_UNLOCK_PASSWORD', '--raw'],
-      { BW_UNLOCK_PASSWORD: validatedArgs.password },
-    );
-    if (response.output) {
-      process.env['BW_SESSION'] = response.output;
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: 'Vault unlocked successfully. You can now retry the operation.',
-          },
-        ],
-        isError: false,
-      };
+    //
+    // A correct password sometimes fails on the first try (slower, ~15-20 s)
+    // and works seconds later, so a failure that is not an explicit "invalid
+    // master password" is retried once. A rejected password is never retried.
+    let error = '';
+    for (let attempt = 1; attempt <= UNLOCK_PASSWORD_ATTEMPTS; attempt++) {
+      const response = await executeCliCommand(
+        'unlock',
+        ['--passwordenv', 'BW_UNLOCK_PASSWORD', '--raw'],
+        { BW_UNLOCK_PASSWORD: validatedArgs.password },
+      );
+      if (response.output) {
+        process.env['BW_SESSION'] = response.output;
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: 'Vault unlocked successfully. You can now retry the operation.',
+            },
+          ],
+          isError: false,
+        };
+      }
+      // Raw stderr goes to the server log only (diagnostics), never to the
+      // LLM; the LLM gets the whitelisted message from scrubUnlockStderr.
+      const raw = response.errorOutput ?? '';
+      console.error(
+        `bw unlock failed (attempt ${attempt}/${UNLOCK_PASSWORD_ATTEMPTS}): ${raw.replace(/\s+/g, ' ').slice(0, 500)}`,
+      );
+      error = scrubUnlockStderr(raw);
+      if (error !== 'Unlock failed.') break;
+      if (attempt < UNLOCK_PASSWORD_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, UNLOCK_RETRY_DELAY_MS));
+      }
+    }
+
+    let text: string;
+    if (error === 'Invalid master password.') {
+      text =
+        'Unlock failed: Bitwarden rejected the master password. Ask the user to confirm the password and call this tool again.';
+    } else if (error === 'Unlock failed.') {
+      text =
+        'Unlock failed for a reason other than the password (already retried). Do not ask the user for a new password; wait a few seconds and call this tool again with the same password.';
+    } else {
+      text = `Unlock failed: ${error}`;
     }
     return {
-      content: [
-        {
-          type: 'text' as const,
-          text: 'Unlock failed: incorrect master password or vault not found. Ask the user to confirm the password and call this tool again.',
-        },
-      ],
+      content: [{ type: 'text' as const, text }],
       isError: true,
     };
   },
